@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Instalando o Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -33,7 +33,7 @@ jobs:
         run: python bluesky_bot.py
 
       - name: Salvando a lista de URLs atualizada (Auto-commit)
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@v7
         with:
           commit_message: "Bot: Atualizando histórico de links postados [skip ci]"
           file_pattern: 'posted_urls.txt'
