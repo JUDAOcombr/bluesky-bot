@@ -1,0 +1,39 @@
+name: Bluesky RSS Bot Automação
+
+on:
+  schedule:
+    # Corre no minuto 32 apenas nas horas pares de Brasília (convertidas para UTC)
+    - cron: '32 13,15,17,19,21,23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write # Dá permissão para o GitHub salvar o arquivo TXT de volta no repositório
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixando o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Instalando o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalando as bibliotecas do bot
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executando o script do Bot
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+        run: python bluesky_bot.py
+
+      - name: Salvando a lista de URLs atualizada (Auto-commit)
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Bot: Atualizando histórico de links postados [skip ci]"
+          file_pattern: 'posted_urls.txt'
