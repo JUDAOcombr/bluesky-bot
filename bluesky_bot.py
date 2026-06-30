@@ -35,7 +35,7 @@ def clean_html_and_unescape(raw_html):
     """Remove as tags HTML e converte códigos como &#227; para acentos reais."""
     cleanr = re.compile('<.*?>')
     cleaned_text = re.sub(cleanr, '', raw_html).strip()
-    return html.unescape(cleaned_text) # Aqui resolvemos o problema da acentuação!
+    return html.unescape(cleaned_text)
 
 def extract_image_urls(entry):
     """Vasculha o RSS para encontrar todas as imagens possíveis e retorna uma lista."""
@@ -124,7 +124,7 @@ def main():
     # POST 2 (Thread): Texto Fixo + CARD da URL
     # ---------------------------------------------------------
     tb2 = client_utils.TextBuilder()
-    tb2.text("Tudo AGORA na SUA 🫵 caixa de entrada! Ou aqui, mesmo. ;D")
+    tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!")
 
     # Para o CARD, podemos reutilizar a primeira imagem como miniatura (se existir)
     card_thumb = image_blobs[0] if image_blobs else None
