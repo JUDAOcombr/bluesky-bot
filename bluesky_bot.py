@@ -2,6 +2,7 @@ import feedparser
 import requests
 import os
 import re
+import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from atproto import Client, client_utils, models
@@ -10,13 +11,11 @@ from atproto import Client, client_utils, models
 RSS_URL = 'https://newsletter.judao.com.br/feed'
 POSTED_FILE = 'posted_urls.txt'
 
-# Pegando as credenciais seguras do GitHub
 BSKY_HANDLE = os.getenv('BSKY_HANDLE')
 BSKY_PASSWORD = os.getenv('BSKY_PASSWORD')
 # =================================================
 
 def is_time_allowed():
-    """Verifica se o horário atual de Brasília está entre 10h00 e 22h00."""
     tz_brasilia = ZoneInfo("America/Sao_Paulo")
     hour = datetime.now(tz_brasilia).hour
     print(f"Hora atual em Brasília: {hour}h")
@@ -32,21 +31,40 @@ def save_posted_url(url):
     with open(POSTED_FILE, 'a') as f:
         f.write(url + '\n')
 
-def clean_html(raw_html):
+def clean_html_and_unescape(raw_html):
+    """Remove as tags HTML e converte códigos como &#227; para acentos reais."""
     cleanr = re.compile('<.*?>')
-    return re.sub(cleanr, '', raw_html).strip()
+    cleaned_text = re.sub(cleanr, '', raw_html).strip()
+    return html.unescape(cleaned_text) # Aqui resolvemos o problema da acentuação!
+
+def extract_image_urls(entry):
+    """Vasculha o RSS para encontrar todas as imagens possíveis e retorna uma lista."""
+    urls = []
+    
+    # Tenta procurar na tag media_content
+    if 'media_content' in entry:
+        for media in entry.media_content:
+            if 'url' in media and media['url'] not in urls:
+                urls.append(media['url'])
+                
+    # Procura dentro do HTML principal do post usando Regex
+    html_content = entry.get('content', [{'value': entry.get('summary', '')}])[0]['value']
+    img_tags = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_content)
+    for img in img_tags:
+        if img not in urls:
+            urls.append(img)
+            
+    return urls
 
 def main():
     if not BSKY_HANDLE or not BSKY_PASSWORD:
-        print("Erro: Credenciais BSKY_HANDLE ou BSKY_PASSWORD não encontradas nos Secrets.")
+        print("Erro: Credenciais não encontradas nos Secrets.")
         return
 
-    # 1. Verifica janela de horário
     if not is_time_allowed():
         print("Fora do horário permitido (10h às 22h). Script encerrado.")
         return
 
-    # 2. Lê o RSS
     feed = feedparser.parse(RSS_URL)
     if not feed.entries:
         print("Nenhum post encontrado no RSS.")
@@ -55,7 +73,6 @@ def main():
     latest_entry = feed.entries[0]
     url = latest_entry.link
 
-    # 3. Verifica duplicata
     posted = get_posted_urls()
     if url in posted:
         print("O post mais recente já foi publicado anteriormente.")
@@ -63,52 +80,74 @@ def main():
 
     print(f"Novo post detectado: {latest_entry.title}")
 
-    title = latest_entry.title
+    # Extrai o Título e a Descrição (com a correção de acentuação)
+    title = html.unescape(latest_entry.title)
     raw_description = latest_entry.get('summary', 'Sem descrição')
-    description = clean_html(raw_description)
-    description = description[:250] + "..." if len(description) > 250 else description
+    description = clean_html_and_unescape(raw_description)
+    
+    # Limita o tamanho para o Bluesky não dar erro (max 300 caracteres)
+    short_desc = description[:250] + "..." if len(description) > 250 else description
 
-    image_url = None
-    if 'media_content' in latest_entry:
-        image_url = latest_entry.media_content[0]['url']
-    elif 'enclosures' in latest_entry and len(latest_entry.enclosures) > 0:
-        image_url = latest_entry.enclosures[0].href
+    # Extrai as imagens (Vamos pegar no máximo as 2 primeiras)
+    all_images = extract_image_urls(latest_entry)
+    images_to_post = all_images[:2]
 
-    # 4. Login no Bluesky
+    # Inicia Login
     client = Client()
     client.login(BSKY_HANDLE, BSKY_PASSWORD)
 
-    # 5. POST 1 (Título + URL + Imagem)
+    # ---------------------------------------------------------
+    # POST 1: Descrição + URL + 2 Imagens Embedadas
+    # ---------------------------------------------------------
     tb1 = client_utils.TextBuilder()
-    tb1.text(f"{title}\n\n")
+    tb1.text(f"{short_desc}\n\n")
     tb1.link(url, url)
 
-    embed = None
-    if image_url:
-        print(f"Baixando imagem: {image_url}")
-        img_req = requests.get(image_url)
+    # Baixa e prepara as imagens para o Post 1
+    image_blobs = []
+    bsky_images = []
+    
+    for img_url in images_to_post:
+        print(f"Baixando imagem: {img_url}")
+        img_req = requests.get(img_url)
         if img_req.status_code == 200:
-            image_blob = client.upload_blob(img_req.content).blob
-            embed = models.AppBskyEmbedImages.Main(
-                images=[models.AppBskyEmbedImages.Image(alt=title, image=image_blob)]
-            )
+            blob = client.upload_blob(img_req.content).blob
+            image_blobs.append(blob)
+            bsky_images.append(models.AppBskyEmbedImages.Image(alt=title, image=blob))
 
-    post1 = client.send_post(text=tb1, embed=embed)
-    print("Post 1 enviado.")
+    embed1 = models.AppBskyEmbedImages.Main(images=bsky_images) if bsky_images else None
 
-    # 6. POST 2 (Thread: Descrição + URL)
+    post1 = client.send_post(text=tb1, embed=embed1)
+    print("Post 1 enviado (Descrição + Imagens).")
+
+    # ---------------------------------------------------------
+    # POST 2 (Thread): Texto Fixo + CARD da URL
+    # ---------------------------------------------------------
     tb2 = client_utils.TextBuilder()
-    tb2.text(f"{description}\n\n")
-    tb2.link(url, url)
+    tb2.text("Tudo AGORA na SUA 🫵 caixa de entrada! Ou aqui, mesmo. ;D")
 
+    # Para o CARD, podemos reutilizar a primeira imagem como miniatura (se existir)
+    card_thumb = image_blobs[0] if image_blobs else None
+
+    # Cria o formato CARD Externo
+    embed2 = models.AppBskyEmbedExternal.Main(
+        external=models.AppBskyEmbedExternal.External(
+            title=title,
+            description=short_desc,
+            uri=url,
+            thumb=card_thumb
+        )
+    )
+
+    # Linka o Post 2 como resposta ao Post 1
     root = models.create_strong_ref(post1)
     parent = models.create_strong_ref(post1)
     reply_ref = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
 
-    client.send_post(text=tb2, reply_to=reply_ref)
-    print("Post 2 (Thread) enviado.")
+    client.send_post(text=tb2, embed=embed2, reply_to=reply_ref)
+    print("Post 2 enviado (Thread com Card).")
 
-    # 7. Salva a URL para não repetir
+    # Salva no histórico local
     save_posted_url(url)
     print("Histórico atualizado localmente.")
 
