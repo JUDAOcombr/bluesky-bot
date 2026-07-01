@@ -1,7 +1,10 @@
-name: Teste Bot Threads
+name: Super Bot RSS (Bluesky & Threads)
 
 on:
-  workflow_dispatch: # Libera o botão para testar manualmente
+  schedule:
+    # Ativa no minuto 32 das horas pares de Brasília (convertidas para o horário UTC do GitHub)
+    - cron: '32 13,15,17,19,21,23 * * *'
+  workflow_dispatch: # Mantém o botão cinza para testar manualmente quando quiser
 
 permissions:
   contents: write
@@ -23,8 +26,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Executando o script do Threads
+      - name: Executando o script unificado
         env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
           THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
           THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
-        run: python bluesky_bot.py  # Mantive o nome do seu arquivo antigo aqui!
+        run: python bluesky_bot.py
+
+      - name: Salvando o histórico de links (Auto-commit)
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "Bot: Atualizando histórico de links postados [skip ci]"
+          file_pattern: 'posted_urls.txt'
