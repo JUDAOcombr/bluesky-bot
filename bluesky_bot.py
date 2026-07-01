@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from atproto import Client, client_utils, models
 
 # ================= CONFIGURAÇÕES =================
-RSS_URL = 'https://newsletter.judao.com.br/rss'
+RSS_URL = 'https://newsletter.judao.com.br/feed'
 POSTED_FILE = 'posted_urls.txt'
 
 BSKY_HANDLE = os.getenv('BSKY_HANDLE')
