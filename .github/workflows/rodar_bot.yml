@@ -2,10 +2,8 @@ name: Super Bot RSS (Bluesky & Threads)
 
 on:
   schedule:
-    # Ativa no minuto 32 das horas pares de Brasília (convertidas para o horário UTC do GitHub)
-    
-  - cron: '32 13,15,17,19,21,23 * * *'
-  workflow_dispatch: # Mantém o botão cinza para testar manualmente quando quiser
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
