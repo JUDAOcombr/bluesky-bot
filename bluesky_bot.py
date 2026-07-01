@@ -1,4 +1,5 @@
 import os
+import time  
 import requests
 import feedparser
 import re
@@ -112,6 +113,9 @@ def post_to_threads(title, short_desc, url):
             return False
 
         container_id = response['id']
+        
+        print(f"Rascunho criado (ID: {container_id}). Aguardando 10 segundos para a Meta processar...")
+        time.sleep(10)  # A pausa mágica para o servidor da Meta não bugar
 
         # Passo 2: Publicar
         publish_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads_publish"
