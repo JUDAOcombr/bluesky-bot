@@ -127,31 +127,22 @@ def is_probably_valid_image_url(img_url):
 
 def get_core_image_name(img_url):
     """
-    Extrai uma identificação 'chave' para evitar fotos duplicadas.
-    Para URLs Substack, tentamos extrair o URL original do CDN.
-    Para o resto, tentamos extrair o nome final do arquivo.
+    Extrai apenas o nome final do arquivo de imagem (ex: e10d5e23..._6000x3380.jpeg).
+    Isso ignora qualquer CDN, redimensionamento ou parâmetro maluco do Substack no meio do link.
     """
     if not img_url:
         return ""
     
+    # 1. Decodifica a URL (transforma códigos como %2F em barras reais /)
     decoded = urllib.parse.unquote(img_url)
     
-    # Tentativa 1: Encontrar URL original em CDNs (Substack)
-    nested_http_start = decoded.find('http://')
-    nested_https_start = decoded.find('https://')
+    # 2. Corta qualquer coisa que vier depois de um '?' 
+    no_query = decoded.split('?')[0]
     
-    if nested_https_start != -1:
-        # Pega do 'https://' em diante
-        original_url = decoded[nested_https_start:]
-        # Remove query parameters do URL original
-        return original_url.split('?')[0]
-    elif nested_http_start != -1:
-        # Pega do 'http://' em diante
-        original_url = decoded[nested_http_start:]
-        return original_url.split('?')[0]
-
-    # Tentativa 2: Fallback para nome final do arquivo
-    return decoded.split('?')[0].split('/')[-1]
+    # 3. Pega absolutamente a última palavra depois da última barra '/' (o nome real do arquivo)
+    filename = no_query.strip('/').split('/')[-1]
+    
+    return filename
 
 
 def deduplicate_images(urls):
