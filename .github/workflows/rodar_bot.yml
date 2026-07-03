@@ -1,8 +1,6 @@
 name: Super Bot RSS (Bluesky & Threads)
 
 on:
-  schedule:
-    - cron: '8,32,44,56 11-23 * * *'
   workflow_dispatch:
 
 permissions:
