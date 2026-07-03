@@ -230,50 +230,40 @@ def extract_image_urls_from_html(html_content, base_url):
 
 def extract_image_urls(entry, article_url):
     """
-    Extrai imagens em duas etapas:
-    1. Tenta pegar imagens do RSS.
-    2. Abre a página do post e pega as imagens do HTML real.
+    Pega APENAS as imagens que estão dentro do corpo do texto da newsletter,
+    exatamente na ordem em que aparecem.
     """
     urls = []
+    
+    # 1. Junta o texto completo do post que vem no RSS
+    html_content = ""
+    if 'content' in entry:
+        for content_item in entry.content:
+            html_content += content_item.get('value', '')
+    elif 'summary' in entry:
+        html_content += entry.summary
 
-    # 1. Imagens declaradas no RSS
-    if 'media_content' in entry:
+    # 2. Busca cirurgicamente as tags <img src="..."> dentro do texto
+    img_tags = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, flags=re.IGNORECASE)
+
+    for img_url in img_tags:
+        normalized = normalize_image_url(img_url, article_url)
+        # O filtro de lixo continua ativo para barrar pixels de rastreamento
+        if normalized and is_probably_valid_image_url(normalized):
+            # Garante que não vai adicionar a mesmíssima URL duas vezes
+            if normalized not in urls:
+                urls.append(normalized)
+
+    # 3. Fallback de segurança (caso o texto venha vazio, pega a capa oficial do RSS)
+    if not urls and 'media_content' in entry:
         for media in entry.media_content:
             media_url = media.get('url')
             normalized = normalize_image_url(media_url, article_url)
             if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
                 urls.append(normalized)
 
-    if 'media_thumbnail' in entry:
-        for media in entry.media_thumbnail:
-            media_url = media.get('url')
-            normalized = normalize_image_url(media_url, article_url)
-            if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
-                urls.append(normalized)
-
-    if 'links' in entry:
-        for link in entry.links:
-            if link.get('type', '').startswith('image/'):
-                normalized = normalize_image_url(link.get('href'), article_url)
-                if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
-                    urls.append(normalized)
-
-    rss_html_parts = []
-
-    if entry.get('summary'):
-        rss_html_parts.append(entry.get('summary'))
-
-    if entry.get('content'):
-        for content_item in entry.get('content', []):
-            if content_item.get('value'):
-                rss_html_parts.append(content_item.get('value'))
-
-    for html_part in rss_html_parts:
-        for img_url in extract_image_urls_from_html(html_part, article_url):
-            if img_url not in urls:
-                urls.append(img_url)
-
-    print(f"Imagens brutas extraídas do RSS: {len(urls)}")
+    print(f"Imagens limpas encontradas no corpo do texto: {len(urls)}")
+    return urls
 
     # 2. Imagens da página real do post
     try:
