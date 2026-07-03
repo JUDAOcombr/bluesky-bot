@@ -5,10 +5,12 @@ import feedparser
 import re
 import html
 import urllib.parse
+import io
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 from atproto import Client, client_utils, models
+from PIL import Image
 
 # ================= CONFIGURAÇÕES =================
 RSS_URL = 'https://newsletter.judao.com.br/feed'
@@ -23,6 +25,7 @@ BSKY_PASSWORD = os.getenv('BSKY_PASSWORD')
 THREADS_USER_ID = os.getenv('THREADS_USER_ID')
 THREADS_TOKEN = os.getenv('THREADS_TOKEN')
 
+# Opcionais, usados apenas para checagem avançada do token do Threads
 THREADS_APP_ID = os.getenv('THREADS_APP_ID')
 THREADS_APP_SECRET = os.getenv('THREADS_APP_SECRET')
 
@@ -43,17 +46,22 @@ def is_time_allowed():
 
 
 def get_posted_urls(file_path):
+    """Carrega URLs já publicadas em um histórico específico."""
     if not os.path.exists(file_path):
         return set()
+
     with open(file_path, 'r', encoding='utf-8') as f:
         return set(line.strip() for line in f if line.strip())
 
 
 def save_posted_url(file_path, url):
+    """Salva uma URL em um histórico específico, sem duplicar."""
     posted = get_posted_urls(file_path)
+
     if url in posted:
         print(f"URL já existe em {file_path}. Histórico não alterado.")
         return
+
     with open(file_path, 'a', encoding='utf-8') as f:
         f.write(url + '\n')
 
@@ -65,11 +73,18 @@ def clean_html_and_unescape(raw_html):
 
 
 def normalize_image_url(img_url, base_url):
+    """Normaliza URL absoluta/relativa e remove escapes HTML."""
     if not img_url:
         return None
+
     img_url = html.unescape(img_url).strip()
-    if not img_url or img_url.startswith("data:"):
+
+    if not img_url:
         return None
+
+    if img_url.startswith("data:"):
+        return None
+
     return urljoin(base_url, img_url)
 
 
@@ -100,26 +115,17 @@ def is_probably_valid_image_url(img_url):
 
 
 def force_substack_image_size(img_url):
-    """
-    HACK GENIAL: Pede para o servidor do Substack entregar a imagem 
-    já redimensionada para 1456 pixels de largura.
-    """
+    """HACK GENIAL: Pede para o servidor do Substack entregar a imagem já redimensionada para 1456 pixels."""
     if not img_url or "substackcdn.com" not in img_url:
         return img_url
-    
-    # Se já tiver um parâmetro de largura no link (ex: w_2400, w_800), substitui para w_1456
     if re.search(r'w_\d+', img_url):
         return re.sub(r'w_\d+', 'w_1456', img_url)
     else:
-        # Se não tiver, insere o parâmetro de largura logo depois do comando /fetch/ do CDN
         return img_url.replace('/fetch/', '/fetch/w_1456,c_limit,')
 
 
 def extract_image_urls(entry, article_url):
-    """
-    Pega APENAS as imagens que estão dentro do corpo do texto da newsletter,
-    exatamente na ordem em que aparecem e já com tamanho ideal.
-    """
+    """Pega APENAS as imagens que estão dentro do corpo do texto da newsletter, na ordem."""
     urls = []
     
     html_content = ""
@@ -147,13 +153,13 @@ def extract_image_urls(entry, article_url):
                 if optimized not in urls:
                     urls.append(optimized)
 
-    print(f"Imagens limpas (e otimizadas via CDN) encontradas: {len(urls)}")
+    print(f"Imagens limpas encontradas: {len(urls)}")
     return urls
 
 
 def checar_threads_basico():
     if not THREADS_USER_ID or not THREADS_TOKEN:
-        print("Threads não configurado: THREADS_USER_ID ou THREADS_TOKEN ausente.")
+        print("Threads não configurado.")
         return False
 
     print("\n--- Checando configuração básica do Threads ---")
@@ -198,10 +204,7 @@ def checar_threads_token_avancado():
 
 
 def download_image_for_bluesky(img_url):
-    """
-    Baixa a imagem. Como já hackeamos o CDN para mandar 1456px, 
-    ela já vem leve e pronta, sem precisar de Pillow.
-    """
+    """Baixa a imagem. O CDN do Substack já a entrega leve a 1456px."""
     try:
         img_req = requests.get(img_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
 
@@ -221,6 +224,18 @@ def download_image_for_bluesky(img_url):
         return None
 
 
+def get_image_dimensions(image_bytes):
+    """Lê cirurgicamente largura e altura da imagem usando Pillow."""
+    if not image_bytes:
+        return None, None
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return img.size # (width, height)
+    except Exception as e:
+        print(f"Erro ao ler dimensões da imagem: {e}")
+        return None, None
+
+
 def post_to_bluesky(title, short_desc, url, images_to_post):
     print("\n--- Iniciando postagem no Bluesky ---")
 
@@ -232,6 +247,7 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         client = Client()
         client.login(BSKY_HANDLE, BSKY_PASSWORD)
 
+        # Post 1: texto + link inserido nativamente + até duas primeiras imagens
         tb1 = client_utils.TextBuilder()
         tb1.text(f"{short_desc}\n\n")
         tb1.link(url, url)
@@ -243,19 +259,35 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
             image_bytes = download_image_for_bluesky(img_url)
             if not image_bytes:
                 continue
+            
+            # Lê as dimensões (largura, altura)
+            width, height = get_image_dimensions(image_bytes)
+            
             try:
                 blob = client.upload_blob(image_bytes).blob
                 image_blobs.append(blob)
-                bsky_images.append(models.AppBskyEmbedImages.Image(alt=title, image=blob))
-                print(f"Upload concluído: {img_url}")
+                
+                # Prepara o objeto da imagem incluindo o aspecto ratio
+                bsky_images.append(
+                    models.AppBskyEmbedImages.Image(
+                        alt=title, 
+                        image=blob,
+                        aspect_ratio=models.AppBskyEmbedImages.AspectRatio(
+                            width=width if width else 1, # Fallback seguro
+                            height=height if height else 1
+                        )
+                    )
+                )
+                print(f"Upload concluído ({width}x{height}): {img_url}")
             except Exception as e:
                 print(f"Erro ao enviar imagem ao Bluesky: {e}")
 
         embed1 = models.AppBskyEmbedImages.Main(images=bsky_images) if bsky_images else None
 
         post1 = client.send_post(text=tb1, embed=embed1)
-        print(f"Post 1 enviado para o Bluesky com {len(bsky_images)} imagem(ns).")
+        print(f"Post 1 enviado para o Bluesky com {len(bsky_images)} imagem(ns) no formato original.")
 
+        # Post 2: resposta com chamada + link/card (Este mantém a moldura quadrada nativa)
         tb2 = client_utils.TextBuilder()
         tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!\n\n")
         tb2.link(url, url)
@@ -446,6 +478,7 @@ def main():
     description = clean_html_and_unescape(latest_entry.get('summary', 'Sem descrição'))
     short_desc = description[:240] + "..." if len(description) > 240 else description
 
+    # Coleta as imagens direto do corpo do HTML (seguro e sem duplicatas nativas)
     all_images = extract_image_urls(latest_entry, url)
     images_to_post = all_images[:2]
 
