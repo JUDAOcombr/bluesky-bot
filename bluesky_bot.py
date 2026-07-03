@@ -6,6 +6,7 @@ import re
 import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
 from atproto import Client, client_utils, models
 
 # ================= CONFIGURAÇÕES =================
@@ -27,6 +28,10 @@ THREADS_APP_SECRET = os.getenv('THREADS_APP_SECRET')
 
 REQUEST_TIMEOUT = 30
 THREADS_PROCESSING_WAIT = 10
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; JUDAO-Social-Bot/1.0)"
+}
 # =================================================
 
 
@@ -64,21 +69,198 @@ def clean_html_and_unescape(raw_html):
     return html.unescape(cleaned_text)
 
 
-def extract_image_urls(entry):
-    """Extrai imagens do RSS, mantendo a ordem em que aparecem."""
+def normalize_image_url(img_url, base_url):
+    """Normaliza URL absoluta/relativa e remove escapes HTML."""
+    if not img_url:
+        return None
+
+    img_url = html.unescape(img_url).strip()
+
+    if not img_url:
+        return None
+
+    if img_url.startswith("data:"):
+        return None
+
+    return urljoin(base_url, img_url)
+
+
+def is_probably_valid_image_url(img_url):
+    """Filtra logos, pixels e assets que não parecem ser imagens editoriais do post."""
+    if not img_url:
+        return False
+
+    lowered = img_url.lower()
+
+    blocked_terms = [
+        "avatar",
+        "logo",
+        "icon",
+        "favicon",
+        "sprite",
+        "pixel",
+        "tracking",
+        "spacer",
+        "blank",
+        "transparent",
+        "gravatar",
+    ]
+
+    if any(term in lowered for term in blocked_terms):
+        return False
+
+    allowed_extensions = [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+
+    # Aceita URLs com extensão clara ou URLs de CDN com parâmetros.
+    if any(ext in lowered for ext in allowed_extensions):
+        return True
+
+    # Muitos CDNs não terminam a URL com extensão, então não bloqueamos agressivamente.
+    if "image" in lowered or "upload" in lowered or "cdn" in lowered or "substack" in lowered:
+        return True
+
+    return True
+
+
+def extract_srcset_urls(srcset_value, base_url):
+    """Extrai URLs de atributos srcset/data-srcset."""
     urls = []
 
+    if not srcset_value:
+        return urls
+
+    parts = srcset_value.split(",")
+
+    for part in parts:
+        candidate = part.strip().split(" ")[0]
+        normalized = normalize_image_url(candidate, base_url)
+
+        if normalized and is_probably_valid_image_url(normalized):
+            urls.append(normalized)
+
+    return urls
+
+
+def extract_image_urls_from_html(html_content, base_url):
+    """Extrai imagens de um HTML usando src, data-src, srcset, data-srcset e og:image."""
+    urls = []
+
+    if not html_content:
+        return urls
+
+    # og:image / twitter:image
+    meta_patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+    ]
+
+    for pattern in meta_patterns:
+        for match in re.findall(pattern, html_content, flags=re.IGNORECASE):
+            normalized = normalize_image_url(match, base_url)
+            if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
+                urls.append(normalized)
+
+    # <img ...>
+    img_tags = re.findall(r'<img[^>]*>', html_content, flags=re.IGNORECASE)
+
+    for tag in img_tags:
+        attr_patterns = [
+            r'\ssrc=["\']([^"\']+)["\']',
+            r'\sdata-src=["\']([^"\']+)["\']',
+            r'\sdata-original=["\']([^"\']+)["\']',
+            r'\sdata-lazy-src=["\']([^"\']+)["\']',
+        ]
+
+        for pattern in attr_patterns:
+            for match in re.findall(pattern, tag, flags=re.IGNORECASE):
+                normalized = normalize_image_url(match, base_url)
+                if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
+                    urls.append(normalized)
+
+        srcset_patterns = [
+            r'\ssrcset=["\']([^"\']+)["\']',
+            r'\sdata-srcset=["\']([^"\']+)["\']',
+        ]
+
+        for pattern in srcset_patterns:
+            for srcset_value in re.findall(pattern, tag, flags=re.IGNORECASE):
+                for srcset_url in extract_srcset_urls(srcset_value, base_url):
+                    if srcset_url not in urls:
+                        urls.append(srcset_url)
+
+    return urls
+
+
+def extract_image_urls(entry, article_url):
+    """
+    Extrai imagens em duas etapas:
+    1. Tenta pegar imagens do RSS.
+    2. Abre a página do post e pega as imagens do HTML real.
+
+    Isso corrige o problema de o RSS entregar só uma imagem.
+    """
+    urls = []
+
+    # 1. Imagens declaradas no RSS
     if 'media_content' in entry:
         for media in entry.media_content:
-            if 'url' in media and media['url'] not in urls:
-                urls.append(media['url'])
+            media_url = media.get('url')
+            normalized = normalize_image_url(media_url, article_url)
+            if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
+                urls.append(normalized)
 
-    html_content = entry.get('content', [{'value': entry.get('summary', '')}])[0]['value']
-    img_tags = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_content)
+    if 'media_thumbnail' in entry:
+        for media in entry.media_thumbnail:
+            media_url = media.get('url')
+            normalized = normalize_image_url(media_url, article_url)
+            if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
+                urls.append(normalized)
 
-    for img in img_tags:
-        if img not in urls:
-            urls.append(img)
+    if 'links' in entry:
+        for link in entry.links:
+            if link.get('type', '').startswith('image/'):
+                normalized = normalize_image_url(link.get('href'), article_url)
+                if normalized and is_probably_valid_image_url(normalized) and normalized not in urls:
+                    urls.append(normalized)
+
+    rss_html_parts = []
+
+    if entry.get('summary'):
+        rss_html_parts.append(entry.get('summary'))
+
+    if entry.get('content'):
+        for content_item in entry.get('content', []):
+            if content_item.get('value'):
+                rss_html_parts.append(content_item.get('value'))
+
+    for html_part in rss_html_parts:
+        for img_url in extract_image_urls_from_html(html_part, article_url):
+            if img_url not in urls:
+                urls.append(img_url)
+
+    print(f"Imagens extraídas do RSS: {len(urls)}")
+
+    # 2. Imagens da página real do post
+    try:
+        response = requests.get(article_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 200:
+            page_images = extract_image_urls_from_html(response.text, article_url)
+            added = 0
+
+            for img_url in page_images:
+                if img_url not in urls:
+                    urls.append(img_url)
+                    added += 1
+
+            print(f"Imagens adicionais extraídas da página do post: {added}")
+        else:
+            print(f"Não foi possível abrir a página do post para extrair imagens. HTTP {response.status_code}")
+
+    except Exception as e:
+        print(f"Erro ao abrir página do post para extrair imagens: {e}")
 
     return urls
 
@@ -198,6 +380,28 @@ def checar_threads_token_avancado():
         return None
 
 
+def download_image_for_bluesky(img_url):
+    """Baixa imagem para upload no Bluesky."""
+    try:
+        img_req = requests.get(img_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+
+        if img_req.status_code != 200:
+            print(f"Imagem ignorada no Bluesky. HTTP {img_req.status_code}: {img_url}")
+            return None
+
+        content_type = img_req.headers.get("content-type", "")
+
+        if content_type and not content_type.startswith("image/"):
+            print(f"URL ignorada no Bluesky: não parece ser imagem. Content-Type: {content_type} | {img_url}")
+            return None
+
+        return img_req.content
+
+    except Exception as e:
+        print(f"Erro ao baixar imagem para o Bluesky: {e}")
+        return None
+
+
 def post_to_bluesky(title, short_desc, url, images_to_post):
     print("\n--- Iniciando postagem no Bluesky ---")
 
@@ -209,32 +413,36 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         client = Client()
         client.login(BSKY_HANDLE, BSKY_PASSWORD)
 
-        # Post 1: texto + duas primeiras imagens
+        # Post 1: texto + link inserido nativamente + duas primeiras imagens
         tb1 = client_utils.TextBuilder()
-        tb1.text(short_desc)
+        tb1.text(f"{short_desc}\n\n")
+        tb1.link(url, url)
 
         bsky_images = []
         image_blobs = []
 
         for img_url in images_to_post[:2]:
-            try:
-                img_req = requests.get(img_url, timeout=REQUEST_TIMEOUT)
+            image_bytes = download_image_for_bluesky(img_url)
 
-                if img_req.status_code == 200:
-                    blob = client.upload_blob(img_req.content).blob
-                    image_blobs.append(blob)
-                    bsky_images.append(
-                        models.AppBskyEmbedImages.Image(
-                            alt=title,
-                            image=blob
-                        )
+            if not image_bytes:
+                continue
+
+            try:
+                blob = client.upload_blob(image_bytes).blob
+                image_blobs.append(blob)
+                bsky_images.append(
+                    models.AppBskyEmbedImages.Image(
+                        alt=title,
+                        image=blob
                     )
-                    print(f"Imagem enviada ao Bluesky: {img_url}")
-                else:
-                    print(f"Imagem ignorada no Bluesky. HTTP {img_req.status_code}: {img_url}")
+                )
+                print(f"Imagem enviada ao Bluesky: {img_url}")
 
             except Exception as e:
-                print(f"Erro ao baixar imagem para o Bluesky: {e}")
+                print(f"Erro ao enviar imagem ao Bluesky: {e}")
+
+        if len(images_to_post) >= 2 and len(bsky_images) < 2:
+            print("Atenção: duas imagens foram selecionadas, mas nem todas foram enviadas ao Bluesky.")
 
         embed1 = models.AppBskyEmbedImages.Main(images=bsky_images) if bsky_images else None
 
@@ -368,13 +576,13 @@ def criar_primeiro_post_threads_com_imagens(short_desc, images_to_post):
             print("Threads: falha ao criar container do carrossel.")
             return None
 
-        print(f"Threads: carrossel criado. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
+        print(f"Threads: carrossel criado com 2 imagens. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
         time.sleep(THREADS_PROCESSING_WAIT)
 
         return publicar_container_threads(carousel_container_id)
 
     if len(images) == 1:
-        print("Threads: criando post com 1 imagem.")
+        print("Threads: apenas 1 imagem disponível. Criando post com 1 imagem.")
 
         image_payload = {
             'media_type': 'IMAGE',
@@ -449,8 +657,11 @@ def post_to_threads(title, short_desc, url, images_to_post):
         return False
 
     try:
-        # Post 1: texto + duas primeiras imagens
-        first_post_id = criar_primeiro_post_threads_com_imagens(short_desc, images_to_post)
+        # Atualização: Injetando o link e o emoji no texto principal para o Threads
+        threads_first_text = f"{short_desc}\n\n🔗 {url}"
+
+        # Post 1: texto com link e emoji + duas primeiras imagens
+        first_post_id = criar_primeiro_post_threads_com_imagens(threads_first_text, images_to_post)
 
         if not first_post_id:
             print("Threads: primeiro post não foi publicado.")
@@ -514,15 +725,15 @@ def main():
     description = clean_html_and_unescape(latest_entry.get('summary', 'Sem descrição'))
     short_desc = description[:240] + "..." if len(description) > 240 else description
 
-    # Coleta as duas primeiras imagens do post
-    all_images = extract_image_urls(latest_entry)
+    # Coleta as duas primeiras imagens do post, agora também abrindo a página real
+    all_images = extract_image_urls(latest_entry, url)
     images_to_post = all_images[:2]
 
-    print(f"Imagens encontradas no RSS/post: {len(all_images)}")
+    print(f"Imagens encontradas no RSS + página do post: {len(all_images)}")
     print(f"Imagens selecionadas para postagem: {len(images_to_post)}")
 
     for index, img_url in enumerate(images_to_post, start=1):
-        print(f"Imagem {index}: {img_url}")
+        print(f"Imagem selecionada {index}: {img_url}")
 
     sucesso_bsky = False
     sucesso_threads = False
