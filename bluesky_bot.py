@@ -267,7 +267,6 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
                 blob = client.upload_blob(image_bytes).blob
                 image_blobs.append(blob)
                 
-                # CORREÇÃO AQUI: Mudado de AppBskyEmbedImages para AppBskyEmbedDefs
                 bsky_images.append(
                     models.AppBskyEmbedImages.Image(
                         alt=title, 
@@ -448,4 +447,73 @@ def main():
         print("Erro: nenhuma rede está configurada.")
         return
 
-    if not is_time_
+    if not is_time_allowed():
+        print("Fora do horário permitido (10h às 22h). Script encerrado.")
+        return
+
+    feed = feedparser.parse(RSS_URL)
+
+    if not feed.entries:
+        print("Nenhum post encontrado no RSS.")
+        return
+
+    latest_entry = feed.entries[0]
+    url = latest_entry.link
+
+    print(f"Post mais recente no RSS: {latest_entry.title}")
+    print(f"URL: {url}")
+
+    posted_bsky = get_posted_urls(POSTED_BSKY_FILE)
+    posted_threads = get_posted_urls(POSTED_THREADS_FILE)
+
+    already_bsky = url in posted_bsky
+    already_threads = url in posted_threads
+
+    if already_bsky and already_threads:
+        print("O post mais recente já foi publicado anteriormente no Bluesky e no Threads.")
+        return 
+
+    title = html.unescape(latest_entry.title)
+    description = clean_html_and_unescape(latest_entry.get('summary', 'Sem descrição'))
+    short_desc = description[:240] + "..." if len(description) > 240 else description
+
+    all_images = extract_image_urls(latest_entry, url)
+    images_to_post = all_images[:2]
+
+    print(f"Imagens selecionadas para postagem: {len(images_to_post)}")
+
+    sucesso_bsky = False
+    sucesso_threads = False
+
+    # ================= BLUESKY =================
+    if already_bsky:
+        print("\nBluesky: post mais recente já publicado.")
+    elif not bsky_config_ok:
+        print("\nBluesky pulado: credenciais ausentes.")
+    else:
+        sucesso_bsky = post_to_bluesky(title, short_desc, url, images_to_post)
+        if sucesso_bsky:
+            save_posted_url(POSTED_BSKY_FILE, url)
+            print("Histórico do Bluesky atualizado.")
+
+    # ================= THREADS =================
+    if already_threads:
+        print("\nThreads: post mais recente já publicado.")
+    elif not threads_config_ok:
+        print("\nThreads pulado: credenciais ausentes.")
+    else:
+        checar_threads_basico()
+        checar_threads_token_avancado()
+        sucesso_threads = post_to_threads(title, short_desc, url, images_to_post)
+        if sucesso_threads:
+            save_posted_url(POSTED_THREADS_FILE, url)
+            print("Histórico do Threads atualizado.")
+
+    # ================= RESUMO =================
+    print("\nResumo da execução:")
+    print(f"Bluesky: {sucesso_bsky}")
+    print(f"Threads: {sucesso_threads}")
+
+
+if __name__ == '__main__':
+    main()
