@@ -11,9 +11,6 @@ from atproto import Client, client_utils, models
 # ================= CONFIGURAÇÕES =================
 RSS_URL = 'https://newsletter.judao.com.br/feed'
 
-# Histórico antigo, mantido só para migração
-LEGACY_POSTED_FILE = 'posted_urls.txt'
-
 # Históricos separados por rede
 POSTED_BSKY_FILE = 'posted_urls_bluesky.txt'
 POSTED_THREADS_FILE = 'posted_urls_threads.txt'
@@ -28,7 +25,8 @@ THREADS_TOKEN = os.getenv('THREADS_TOKEN')
 THREADS_APP_ID = os.getenv('THREADS_APP_ID')
 THREADS_APP_SECRET = os.getenv('THREADS_APP_SECRET')
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 30
+THREADS_PROCESSING_WAIT = 10
 # =================================================
 
 
@@ -40,7 +38,7 @@ def is_time_allowed():
 
 
 def get_posted_urls(file_path):
-    """Carrega URLs já publicadas em um arquivo específico."""
+    """Carrega URLs já publicadas em um histórico específico."""
     if not os.path.exists(file_path):
         return set()
 
@@ -60,32 +58,6 @@ def save_posted_url(file_path, url):
         f.write(url + '\n')
 
 
-def migrate_legacy_history_to_bluesky():
-    """
-    Migra o histórico antigo posted_urls.txt para o histórico do Bluesky.
-
-    Importante:
-    - O histórico antigo é migrado apenas para o Bluesky.
-    - O Threads fica separado, para permitir novas tentativas caso ele tenha falhado antes.
-    """
-    legacy_urls = get_posted_urls(LEGACY_POSTED_FILE)
-
-    if not legacy_urls:
-        return
-
-    bsky_urls = get_posted_urls(POSTED_BSKY_FILE)
-    urls_to_migrate = legacy_urls - bsky_urls
-
-    if not urls_to_migrate:
-        return
-
-    with open(POSTED_BSKY_FILE, 'a', encoding='utf-8') as f:
-        for url in sorted(urls_to_migrate):
-            f.write(url + '\n')
-
-    print(f"Migração concluída: {len(urls_to_migrate)} URLs antigas copiadas para {POSTED_BSKY_FILE}.")
-
-
 def clean_html_and_unescape(raw_html):
     cleanr = re.compile('<.*?>')
     cleaned_text = re.sub(cleanr, '', raw_html).strip()
@@ -93,6 +65,7 @@ def clean_html_and_unescape(raw_html):
 
 
 def extract_image_urls(entry):
+    """Extrai imagens do RSS, mantendo a ordem em que aparecem."""
     urls = []
 
     if 'media_content' in entry:
@@ -113,9 +86,7 @@ def extract_image_urls(entry):
 def checar_threads_basico():
     """
     Checa se o token do Threads responde para a conta configurada.
-
-    Essa checagem confirma acesso básico.
-    Ela não garante, sozinha, que a permissão de publicação está liberada.
+    Essa checagem valida acesso básico, mas não garante sozinha a permissão de publicação.
     """
     if not THREADS_USER_ID or not THREADS_TOKEN:
         print("Threads não configurado: THREADS_USER_ID ou THREADS_TOKEN ausente.")
@@ -238,15 +209,14 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         client = Client()
         client.login(BSKY_HANDLE, BSKY_PASSWORD)
 
-        # Post 1: descrição + link + imagens
+        # Post 1: texto + duas primeiras imagens
         tb1 = client_utils.TextBuilder()
-        tb1.text(f"{short_desc}\n\n")
-        tb1.link(url, url)
+        tb1.text(short_desc)
 
-        image_blobs = []
         bsky_images = []
+        image_blobs = []
 
-        for img_url in images_to_post:
+        for img_url in images_to_post[:2]:
             try:
                 img_req = requests.get(img_url, timeout=REQUEST_TIMEOUT)
 
@@ -259,6 +229,7 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
                             image=blob
                         )
                     )
+                    print(f"Imagem enviada ao Bluesky: {img_url}")
                 else:
                     print(f"Imagem ignorada no Bluesky. HTTP {img_req.status_code}: {img_url}")
 
@@ -268,11 +239,12 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         embed1 = models.AppBskyEmbedImages.Main(images=bsky_images) if bsky_images else None
 
         post1 = client.send_post(text=tb1, embed=embed1)
-        print("Post 1 enviado para o Bluesky.")
+        print(f"Post 1 enviado para o Bluesky com {len(bsky_images)} imagem(ns).")
 
-        # Post 2: texto fixo + card
+        # Post 2: resposta com chamada + link/card
         tb2 = client_utils.TextBuilder()
-        tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!")
+        tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!\n\n")
+        tb2.link(url, url)
 
         card_thumb = image_blobs[0] if image_blobs else None
 
@@ -290,7 +262,7 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         reply_ref = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
 
         client.send_post(text=tb2, embed=embed2, reply_to=reply_ref)
-        print("Post 2 (Thread) enviado para o Bluesky.")
+        print("Post 2 com link/card enviado para o Bluesky.")
         return True
 
     except Exception as e:
@@ -298,7 +270,178 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
         return False
 
 
-def post_to_threads(title, short_desc, url):
+def criar_container_threads(payload):
+    create_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads"
+
+    response = requests.post(
+        create_url,
+        data=payload,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        print("Erro ao interpretar resposta de criação de container do Threads.")
+        print(f"HTTP status: {response.status_code}")
+        print(response.text)
+        return None
+
+    if response.status_code != 200 or 'id' not in data:
+        print(f"Erro ao criar container do Threads: {data}")
+        return None
+
+    return data['id']
+
+
+def publicar_container_threads(container_id):
+    publish_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads_publish"
+
+    payload = {
+        'creation_id': container_id,
+        'access_token': THREADS_TOKEN
+    }
+
+    response = requests.post(
+        publish_url,
+        data=payload,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        print("Erro ao interpretar resposta de publicação do Threads.")
+        print(f"HTTP status: {response.status_code}")
+        print(response.text)
+        return None
+
+    if response.status_code == 200 and 'id' in data:
+        return data['id']
+
+    print(f"Erro ao publicar container do Threads: {data}")
+    return None
+
+
+def criar_primeiro_post_threads_com_imagens(short_desc, images_to_post):
+    """
+    Cria e publica o primeiro post do Threads:
+    - texto + até duas imagens
+    - se tiver 2 imagens, usa carrossel
+    - se tiver 1 imagem, usa post de imagem
+    - se não tiver imagem, usa post de texto
+    """
+    images = images_to_post[:2]
+
+    if len(images) >= 2:
+        print("Threads: criando carrossel com 2 imagens.")
+
+        child_container_ids = []
+
+        for img_url in images:
+            child_payload = {
+                'media_type': 'IMAGE',
+                'image_url': img_url,
+                'is_carousel_item': 'true',
+                'access_token': THREADS_TOKEN
+            }
+
+            child_id = criar_container_threads(child_payload)
+
+            if not child_id:
+                print("Threads: falha ao criar item do carrossel.")
+                return None
+
+            child_container_ids.append(child_id)
+            print(f"Threads: item de carrossel criado para imagem: {img_url}")
+
+        carousel_payload = {
+            'media_type': 'CAROUSEL',
+            'children': ','.join(child_container_ids),
+            'text': short_desc,
+            'access_token': THREADS_TOKEN
+        }
+
+        carousel_container_id = criar_container_threads(carousel_payload)
+
+        if not carousel_container_id:
+            print("Threads: falha ao criar container do carrossel.")
+            return None
+
+        print(f"Threads: carrossel criado. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
+        time.sleep(THREADS_PROCESSING_WAIT)
+
+        return publicar_container_threads(carousel_container_id)
+
+    if len(images) == 1:
+        print("Threads: criando post com 1 imagem.")
+
+        image_payload = {
+            'media_type': 'IMAGE',
+            'image_url': images[0],
+            'text': short_desc,
+            'access_token': THREADS_TOKEN
+        }
+
+        image_container_id = criar_container_threads(image_payload)
+
+        if not image_container_id:
+            print("Threads: falha ao criar container de imagem.")
+            return None
+
+        print(f"Threads: post com imagem criado. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
+        time.sleep(THREADS_PROCESSING_WAIT)
+
+        return publicar_container_threads(image_container_id)
+
+    print("Threads: nenhuma imagem encontrada. Criando primeiro post apenas com texto.")
+
+    text_payload = {
+        'media_type': 'TEXT',
+        'text': short_desc,
+        'access_token': THREADS_TOKEN
+    }
+
+    text_container_id = criar_container_threads(text_payload)
+
+    if not text_container_id:
+        print("Threads: falha ao criar container de texto.")
+        return None
+
+    print(f"Threads: post de texto criado. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
+    time.sleep(THREADS_PROCESSING_WAIT)
+
+    return publicar_container_threads(text_container_id)
+
+
+def criar_segundo_post_threads_com_link_preview(url, reply_to_id):
+    """
+    Cria e publica o segundo post do Threads como resposta ao primeiro:
+    chamada + link + link_attachment para tentar gerar o preview/card.
+    """
+    second_text = f"Se inscreva e leia na SUA 🫵 caixa de entrada!\n\n🔗 {url}"
+
+    reply_payload = {
+        'media_type': 'TEXT',
+        'text': second_text,
+        'reply_to_id': reply_to_id,
+        'link_attachment': url,
+        'access_token': THREADS_TOKEN
+    }
+
+    reply_container_id = criar_container_threads(reply_payload)
+
+    if not reply_container_id:
+        print("Threads: falha ao criar o segundo post com link preview.")
+        return None
+
+    print(f"Threads: segundo post com link preview criado. Aguardando {THREADS_PROCESSING_WAIT} segundos...")
+    time.sleep(THREADS_PROCESSING_WAIT)
+
+    return publicar_container_threads(reply_container_id)
+
+
+def post_to_threads(title, short_desc, url, images_to_post):
     print("\n--- Iniciando postagem no Threads ---")
 
     if not THREADS_USER_ID or not THREADS_TOKEN:
@@ -306,66 +449,24 @@ def post_to_threads(title, short_desc, url):
         return False
 
     try:
-        post_text = f"{title}\n\n{short_desc}\n\n🔗 {url}"
+        # Post 1: texto + duas primeiras imagens
+        first_post_id = criar_primeiro_post_threads_com_imagens(short_desc, images_to_post)
 
-        # Passo 1: criar o rascunho/container
-        create_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads"
-        create_payload = {
-            'media_type': 'TEXT',
-            'text': post_text,
-            'access_token': THREADS_TOKEN
-        }
-
-        create_response = requests.post(
-            create_url,
-            data=create_payload,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        try:
-            create_data = create_response.json()
-        except Exception:
-            print("Erro ao interpretar resposta do rascunho do Threads.")
-            print(f"HTTP status: {create_response.status_code}")
-            print(create_response.text)
+        if not first_post_id:
+            print("Threads: primeiro post não foi publicado.")
             return False
 
-        if create_response.status_code != 200 or 'id' not in create_data:
-            print(f"Erro no rascunho do Threads: {create_data}")
+        print(f"Threads: primeiro post publicado com sucesso. ID: {first_post_id}")
+
+        # Post 2: resposta com chamada + link preview
+        second_post_id = criar_segundo_post_threads_com_link_preview(url, first_post_id)
+
+        if not second_post_id:
+            print("Threads: segundo post com link preview não foi publicado.")
             return False
 
-        container_id = create_data['id']
-
-        print(f"Rascunho criado (ID: {container_id}). Aguardando 10 segundos para a Meta processar...")
-        time.sleep(10)
-
-        # Passo 2: publicar o rascunho/container
-        publish_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads_publish"
-        publish_payload = {
-            'creation_id': container_id,
-            'access_token': THREADS_TOKEN
-        }
-
-        publish_response = requests.post(
-            publish_url,
-            data=publish_payload,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        try:
-            publish_data = publish_response.json()
-        except Exception:
-            print("Erro ao interpretar resposta da publicação do Threads.")
-            print(f"HTTP status: {publish_response.status_code}")
-            print(publish_response.text)
-            return False
-
-        if publish_response.status_code == 200 and 'id' in publish_data:
-            print("Post enviado com sucesso para o Threads!")
-            return True
-
-        print(f"Erro na publicação do Threads: {publish_data}")
-        return False
+        print(f"Threads: segundo post com link preview publicado com sucesso. ID: {second_post_id}")
+        return True
 
     except Exception as e:
         print(f"Erro ao postar no Threads: {e}")
@@ -373,8 +474,6 @@ def post_to_threads(title, short_desc, url):
 
 
 def main():
-    migrate_legacy_history_to_bluesky()
-
     bsky_config_ok = bool(BSKY_HANDLE and BSKY_PASSWORD)
     threads_config_ok = bool(THREADS_USER_ID and THREADS_TOKEN)
 
@@ -415,9 +514,15 @@ def main():
     description = clean_html_and_unescape(latest_entry.get('summary', 'Sem descrição'))
     short_desc = description[:240] + "..." if len(description) > 240 else description
 
-    # Coleta as imagens para o Bluesky
+    # Coleta as duas primeiras imagens do post
     all_images = extract_image_urls(latest_entry)
     images_to_post = all_images[:2]
+
+    print(f"Imagens encontradas no RSS/post: {len(all_images)}")
+    print(f"Imagens selecionadas para postagem: {len(images_to_post)}")
+
+    for index, img_url in enumerate(images_to_post, start=1):
+        print(f"Imagem {index}: {img_url}")
 
     sucesso_bsky = False
     sucesso_threads = False
@@ -444,14 +549,13 @@ def main():
     else:
         threads_basico_ok = checar_threads_basico()
 
-        # Checagem avançada opcional. Não bloqueia sozinha a publicação,
-        # mas ajuda a diagnosticar problemas de token/permissão no log.
+        # Checagem avançada opcional. Não bloqueia sozinha a publicação.
         checar_threads_token_avancado()
 
         if not threads_basico_ok:
             print("Threads pulado: checagem básica falhou.")
         else:
-            sucesso_threads = post_to_threads(title, short_desc, url)
+            sucesso_threads = post_to_threads(title, short_desc, url, images_to_post)
 
             if sucesso_threads:
                 save_posted_url(POSTED_THREADS_FILE, url)
