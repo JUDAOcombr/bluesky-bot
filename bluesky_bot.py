@@ -249,7 +249,8 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
 
         # Post 1: texto + link inserido nativamente + até duas primeiras imagens
         tb1 = client_utils.TextBuilder()
-        tb1.text(f"{short_desc}\n\n")
+        # Adicionado o emoji de link 🔗 antes do link oficial do Bluesky
+        tb1.text(f"{short_desc}\n🔗 ")
         tb1.link(url, url)
 
         bsky_images = []
@@ -288,7 +289,7 @@ def post_to_bluesky(title, short_desc, url, images_to_post):
 
         # Post 2: resposta com chamada + link/card
         tb2 = client_utils.TextBuilder()
-        tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!\n\n")
+        tb2.text("Se inscreva e leia na SUA 🫵 caixa de entrada!\n ")
         tb2.link(url, url)
 
         card_thumb = image_blobs[0] if image_blobs else None
